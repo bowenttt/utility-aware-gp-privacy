@@ -171,7 +171,7 @@ if __name__ == "__main__":
     eigs_M_T = np.linalg.eigvalsh(M_T)
     eigs_A = np.linalg.eigvalsh(A)
 
-    # 这里的 rank 会非常漂亮地显示为 10，完美印证你的理论！
+
     print("rank(M_S) (numerical):", np.linalg.matrix_rank(M_S))
     print("min eigen M_S:", eigs_M_S[0])
     print("min eigen M_T:", eigs_M_T[0])
