@@ -1,72 +1,86 @@
+
 """
 gp_privacy.py
 
-Generates:
-- n random 2D points
-- RBF covariance matrix K_xx
-- A = K_xx + v * I (observation noise variance v)
-- M_S: low-rank PSD matrix via L @ L.T with rank < n
-- M_T: full-rank PSD matrix via R @ R.T
+Utility-aware Gaussian Process privacy experiment.
 
-Simple example usage included under __main__.
+This script supports two modes:
+- full-rank mode: eta > 0, reconstructs full-space C_opt = inv(W) - A
+- singular-W mode: eta = 0, analyzes the finite released subspace W = O1 Lambda O1.T
 """
 
 import numpy as np
+
 try:
     import cvxpy as cp
 except Exception:
     cp = None
 
-#N个坐标点
+
+# N random 2D coordinate points.
 def generate_random_points(n, low=0.0, high=1.0, seed=None):
     rng = np.random.default_rng(seed)
     return rng.uniform(low=low, high=high, size=(n, 2))
 
-#点之间距离关系
+
+# RBF covariance kernel.
 def rbf_kernel(X, Y=None, lengthscale=1.0, variance=1.0):
     X = np.asarray(X)
     if Y is None:
         Y = X
     else:
         Y = np.asarray(Y)
-    # 计算 X 和 Y 之间的成对平方距离
     sq_dist = np.sum((X[:, None, :] - Y[None, :, :]) ** 2, axis=-1)
-    K = variance * np.exp(-0.5 * sq_dist / (lengthscale ** 2))
-    return K
+    return variance * np.exp(-0.5 * sq_dist / (lengthscale ** 2))
 
-#生成矩阵A = K + v * I
+
+# A = K + v I.
 def construct_A(K, noise_variance):
     n = K.shape[0]
     return K + noise_variance * np.eye(n)
 
 
+def solve_for_W_cvxpy(
+    A,
+    M_S,
+    M_T,
+    epsilon_prime,
+    reg=1e-6,
+    small=1e-7,
+    eta=1e-4,
+    solver=None,
+):
+    """Form and solve the SDP for the effective precision matrix W.
 
-def solve_for_W_cvxpy(A, M_S, M_T, epsilon_prime, reg=1e-6, small=1e-7, solver=cp.SCS if cp is not None else None):
-    """Form and solve the CVXPY problem described by the user.
+    Full-rank case: eta > 0 enforces W >= eta I, so W is invertible and a
+    full-space covariance C_opt = inv(W) - A can be reconstructed.
+
+    Singular case: eta = 0 enforces only W >= 0, so W may be singular. In
+    that case, do not reconstruct a full-space C_opt. Use the subspace
+    diagnostic implemented by analyze_singular_subspace below.
 
     Minimizes: trace(M_S_clean @ W) + reg * ||W||_F
-    s.t. W >> 0, inv(A) - W >> 0, trace(M_T_clean @ W) >= epsilon_prime
+    s.t. W >= eta I, inv(A) - W >= 0, trace(M_T_clean @ W) >= epsilon_prime
 
     Returns: (W_opt, prob) where W_opt is the numpy array of the solution (or None).
     """
     if cp is None:
         raise ImportError("cvxpy is not installed. Install with: pip install cvxpy")
+    if solver is None:
+        solver = cp.SCS
 
     n = A.shape[0]
-    # Clean matrices to avoid tiny negative eigenvalues
+    # Clean matrices to avoid tiny negative eigenvalues.
     M_S_clean = M_S + small * np.eye(n)
     M_T_clean = M_T + small * np.eye(n)
 
-    # Compute inverse of A (user expected inv_A = np.linalg.inv(A))
     inv_A = np.linalg.inv(A)
     inv_A_clean = inv_A + small * np.eye(n)
 
     W = cp.Variable((n, n), symmetric=True)
 
-    # Enforce a stricter lower bound on W to avoid near-singularity
-    w_min_bound = 1e-4
     constraints = [
-        W >> (w_min_bound * np.eye(n)),
+        W >> (float(eta) * np.eye(n)),
         cp.Constant(inv_A_clean) - W >> 0,
         cp.trace(cp.Constant(M_T_clean) @ W) >= float(epsilon_prime),
     ]
@@ -74,7 +88,6 @@ def solve_for_W_cvxpy(A, M_S, M_T, epsilon_prime, reg=1e-6, small=1e-7, solver=c
     objective = cp.Minimize(cp.trace(cp.Constant(M_S_clean) @ W) + float(reg) * cp.norm(W, 'fro'))
     prob = cp.Problem(objective, constraints)
 
-    # Prefer a high-precision interior-point solver (CVXOPT), fall back to CLARABEL, then to provided solver
     solved = False
     if cp is not None:
         preferred = []
@@ -112,8 +125,44 @@ def solve_for_W_cvxpy(A, M_S, M_T, epsilon_prime, reg=1e-6, small=1e-7, solver=c
     except Exception:
         W_opt = None
 
+    if W_opt is not None:
+        W_opt = (W_opt + W_opt.T) / 2
+
     return W_opt, prob
 
+
+def analyze_singular_subspace(A, W_opt, eig_tol=1e-8):
+    """Analyze the eta=0 singular-W subspace mechanism.
+
+    If W_opt = O1 Lambda O1.T with positive Lambda, the candidate released
+    subspace covariance is C1 = Lambda^{-1} - O1.T @ A @ O1.
+
+    Returns a dictionary with rank, eigenvalues, O1, Lambda, C1, and PSD diagnostics.
+    """
+    W_sym = (W_opt + W_opt.T) / 2
+    eigvals, eigvecs = np.linalg.eigh(W_sym)
+    positive = eigvals > eig_tol
+
+    O1 = eigvecs[:, positive]
+    Lambda_vals = eigvals[positive]
+    Lambda = np.diag(Lambda_vals)
+
+    if Lambda_vals.size == 0:
+        raise ValueError("W_opt has no positive eigenvalues above eig_tol; no shareable subspace exists.")
+
+    C1 = np.diag(1.0 / Lambda_vals) - O1.T @ A @ O1
+    C1 = (C1 + C1.T) / 2
+    C1_eigs = np.linalg.eigvalsh(C1)
+
+    return {
+        "rank": int(Lambda_vals.size),
+        "positive_eigenvalues": Lambda_vals,
+        "O1": O1,
+        "Lambda": Lambda,
+        "C1": C1,
+        "min_eig_C1": float(C1_eigs[0]),
+        "C1_is_psd": bool(C1_eigs[0] >= -1e-7),
+    }
 
 if __name__ == "__main__":
     # Example parameters
@@ -171,7 +220,7 @@ if __name__ == "__main__":
     eigs_M_T = np.linalg.eigvalsh(M_T)
     eigs_A = np.linalg.eigvalsh(A)
 
-
+    # 这里的 rank 会非常漂亮地显示为 10，完美印证你的理论！
     print("rank(M_S) (numerical):", np.linalg.matrix_rank(M_S))
     print("min eigen M_S:", eigs_M_S[0])
     print("min eigen M_T:", eigs_M_T[0])
@@ -183,9 +232,12 @@ if __name__ == "__main__":
     assert eigs_A.min() >= -1e-10
     # --------------- CVXPY solver call -----------------
     epsilon_prime = 10.0
+    # Set eta = 1e-4 for the full-rank implementation used in the current paper.
+    # Set eta = 0.0 to test the singular-W subspace mechanism.
+    eta = 0.0
     print(f"Solving CVXPY problem with epsilon_prime={epsilon_prime}...")
     try:
-        W_opt, prob = solve_for_W_cvxpy(A, M_S, M_T, epsilon_prime)
+        W_opt, prob = solve_for_W_cvxpy(A, M_S, M_T, epsilon_prime, eta=eta)
     except ImportError as e:
         print(str(e))
         W_opt = None
@@ -200,30 +252,47 @@ if __name__ == "__main__":
         M_S_clean = M_S + small * np.eye(n)
         M_T_clean = M_T + small * np.eye(n)
 
-        # Compute final noise matrix C_opt = inv(W_opt) - A
-        # Use pseudo-inverse to avoid inversion blow-up from near-singular W_opt
-        inv_W = np.linalg.pinv(W_opt)
-        C_opt = inv_W - A
-
-        # Clean up numeric asymmetry
-        C_opt = (C_opt + C_opt.T) / 2
-
-        # Project C_opt onto PSD cone to remove tiny negative eigenvalues
-        evals, evecs = np.linalg.eigh(C_opt)
-        evals[evals < 0] = 0.0
-        C_opt = evecs @ np.diag(evals) @ evecs.T
-
-        eigs_C = np.linalg.eigvalsh(C_opt)
-        min_eig_C = eigs_C[0]
-        print("min eigenvalue of C_opt after PSD projection:", min_eig_C)
-
-        # Print solver status and the optimal privacy leakage (objective: trace(M_S_clean @ W))
-        if prob is not None:
-            print("Solver status:", prob.status)
         privacy_leakage = float(np.trace(M_S_clean @ W_opt))
         utility_value = float(np.trace(M_T_clean @ W_opt))
         print("Optimal privacy leakage (trace(M_S @ W_opt)):", privacy_leakage)
         print("Achieved utility (trace(M_T @ W_opt)):", utility_value)
+
+        if eta > 0:
+            # Full-rank implementation: reconstruct C_opt = inv(W_opt) - A.
+            inv_W = np.linalg.inv(W_opt)
+            C_opt = inv_W - A
+
+            # Clean up numeric asymmetry.
+            C_opt = (C_opt + C_opt.T) / 2
+
+            # Project C_opt onto PSD cone to remove tiny negative eigenvalues.
+            evals, evecs = np.linalg.eigh(C_opt)
+            evals[evals < 0] = 0.0
+            C_opt = evecs @ np.diag(evals) @ evecs.T
+
+            eigs_C = np.linalg.eigvalsh(C_opt)
+            min_eig_C = eigs_C[0]
+            print("min eigenvalue of C_opt after PSD projection:", min_eig_C)
+        else:
+            # Singular implementation: do not construct a full-space C_opt.
+            # Instead, check whether the finite released subspace covariance C1 is PSD.
+            singular_info = analyze_singular_subspace(A, W_opt)
+            print("singular-W rank:", singular_info["rank"])
+            print("min positive eigenvalue of W:", singular_info["positive_eigenvalues"].min())
+            print("max positive eigenvalue of W:", singular_info["positive_eigenvalues"].max())
+            print("min eigenvalue of subspace C1:", singular_info["min_eig_C1"])
+            print("C1 is PSD:", singular_info["C1_is_psd"])
+
+            if not singular_info["C1_is_psd"]:
+                raise RuntimeError("Singular-W subspace covariance C1 is not PSD; this singular solution is not physically valid.")
+
+            # For the current plotting code, construct one representative full-space noise
+            # sample from the valid released subspace. The null-space component is not released.
+            O1 = singular_info["O1"]
+            C1 = singular_info["C1"]
+            xi1 = np.random.multivariate_normal(mean=np.zeros(singular_info["rank"]), cov=C1)
+            eta_subspace = O1 @ xi1
+            C_opt = O1 @ C1 @ O1.T
 
     # Task3 Graph
     import matplotlib.pyplot as plt
@@ -239,10 +308,9 @@ if __name__ == "__main__":
 
     Y_clean = true_function(X) + np.random.normal(0, np.sqrt(noise_variance), n)
 
-    # ---------------------------------------------------------
-    # 2. 采样隐私保护噪声并生成 Private Y
-    # ---------------------------------------------------------
-    # 从 C_opt 中采样噪声 eta ~ N(0, C_opt)
+    # Sample privacy noise. In the full-rank case, this is full-space Gaussian noise.
+    # In the singular case, C_opt is the finite subspace covariance lifted back to the
+    # original coordinates; the null-space component is not released.
     eta = np.random.multivariate_normal(mean=np.zeros(n), cov=C_opt)
     Y_private = Y_clean + eta
 
